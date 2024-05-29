@@ -6,16 +6,19 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <sys/time.h>
 #include "serial.h"
 
 #define MAX_FD_NUM (10)
 #define SERIAL_WRITE_BUFF_SIZE (1024*1024)
 #define SERIAL_READ_BUFF_SIZE (16*1024)
+#define RECV_DATA_LEN (688130)
 
 typedef struct {
 	int fd;
 	int send_state;
 	int recv_total_len;
+	long last_recv_time;
 
 	char ip[16];
 	int port;
@@ -36,6 +39,14 @@ typedef struct {
 }TransparentMng;
 static TransparentMng kTransparentMng = {.mutex = PTHREAD_MUTEX_INITIALIZER};
 
+long GetTime() {
+    struct timeval time_;
+    memset(&time_, 0, sizeof(struct timeval));
+
+    gettimeofday(&time_, NULL);
+    return time_.tv_sec*1000 + time_.tv_usec/1000;
+}
+
 int TcpServerCreate(int port) {
 	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
 	if (sockfd < 0) {
@@ -43,6 +54,9 @@ int TcpServerCreate(int port) {
         return -1;
     }
 	
+	int opt = 1;
+	setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (const void*)&opt, sizeof(opt));
+
 	struct sockaddr_in serveraddr;
 	serveraddr.sin_family = AF_INET;
     serveraddr.sin_port = htons(port);
@@ -67,9 +81,11 @@ int TcpServerClose(int sockfd) {
 }
 
 void* ServerProc(void* arg) {
+	int serial_clean_flag = 0;
 	int client_cnt = 0;
 	SocketInfo cli_info[MAX_FD_NUM];
 	fd_set read_fd;
+	fd_set write_fd;
 	int max_fd = kTransparentMng.sock_fd < kTransparentMng.serial_fd ? kTransparentMng.serial_fd : kTransparentMng.sock_fd;
 	int arr_fd[MAX_FD_NUM] = {0};
 	int fd_send[MAX_FD_NUM] = {0};
@@ -78,15 +94,20 @@ void* ServerProc(void* arg) {
 		FD_ZERO(&read_fd);
 		FD_SET(kTransparentMng.sock_fd, &read_fd);
 		FD_SET(kTransparentMng.serial_fd, &read_fd);
+
+		FD_ZERO(&write_fd);
+		FD_SET(kTransparentMng.sock_fd, &write_fd);
+		FD_SET(kTransparentMng.serial_fd, &write_fd);
 		
 		for(int i = 0; i < MAX_FD_NUM; i++) {
 			if (cli_info[i].fd > 0) {
 				FD_SET(cli_info[i].fd, &read_fd);
+				FD_SET(cli_info[i].fd, &write_fd);
 				max_fd = max_fd < cli_info[i].fd ? cli_info[i].fd : max_fd;
 			}
 		}
 		
-		int ret = select(max_fd+1, &read_fd, NULL, NULL, NULL);
+		int ret = select(max_fd+1, &read_fd, &write_fd, NULL, NULL);
 		if (ret < 0) {
 			printf("select fail !\n");
 			break;
@@ -127,9 +148,7 @@ void* ServerProc(void* arg) {
 		if (FD_ISSET(kTransparentMng.serial_fd, &read_fd)) {
 			char buff[1024] = {0};
 			int read_len = read(kTransparentMng.serial_fd, buff, sizeof(buff));
-			if (read_len <= 0) {
-				
-			} else {
+			if (read_len > 0) {
 				if (kTransparentMng.serial_read.cur_size + read_len <= kTransparentMng.serial_read.total_size) {
 					memcpy(kTransparentMng.serial_read.buff+kTransparentMng.serial_read.cur_size, buff, read_len);
 					kTransparentMng.serial_read.cur_size += read_len;
@@ -163,49 +182,46 @@ void* ServerProc(void* arg) {
 
 					printf("we delete connection, client_socket=%d, client_count=%d, ip=%s, port=%d, total_len:%d\n", cli_info[i].fd, client_cnt, cli_info[i].ip, cli_info[i].port, cli_info[i].recv_total_len);
 					client_cnt--;
-					close(cli_info[i].fd);
 					FD_CLR(cli_info[i].fd, &read_fd);
+					close(cli_info[i].fd);
 					memset(&cli_info[i], 0, sizeof(SocketInfo));
 				} else {
+					cli_info[i].last_recv_time = GetTime();
 					cli_info[i].recv_total_len += recv_len;
 					int write_len = write(kTransparentMng.serial_fd, buff, recv_len);
+				}
+			}
+		}
+		
+		for(int i = 0; i < MAX_FD_NUM; i++) {
+			if (cli_info[i].fd == 0 || !cli_info[i].send_state) {
+				continue;
+			}
+			
+			if (FD_ISSET(cli_info[i].fd, &write_fd)) {
+				if (kTransparentMng.serial_read.cur_size != 0) {
+					serial_clean_flag = 1;
+					int send_len = send(cli_info[i].fd, kTransparentMng.serial_read.buff, kTransparentMng.serial_read.cur_size, 0);
+					if (send_len < 0) {
+						cli_info[i].send_state = 0;
+						continue;
+					}
+				}
 
-					// printf("write_len:%d len:%d total_size:%d\n", write_len, recv_len, total_size[i]);
-        			// pthread_mutex_lock(&kTransparentMng.mutex);
-					// if (kTransparentMng.serial_write.cur_size + recv_len <= kTransparentMng.serial_write.total_size) {
-					// 	memcpy(kTransparentMng.serial_write.buff+kTransparentMng.serial_write.cur_size, buff, recv_len);
-					// 	kTransparentMng.serial_write.cur_size += recv_len;
-					// 	printf("recv_len:%d buff_size:%d total_size:%d\n", recv_len, kTransparentMng.serial_write.cur_size, total_size[i]);
-					// } else {
-    				// 	char* p = (char*) realloc(kTransparentMng.serial_write.buff, kTransparentMng.serial_write.total_size + recv_len);
-					// 	if (p == NULL) {
-					// 		printf("space is not enough\n");
-					// 	} else {
-					// 		kTransparentMng.serial_write.buff = p;
-					// 		memset(kTransparentMng.serial_write.buff + kTransparentMng.serial_write.cur_size, 0, recv_len);
-					// 		memcpy(kTransparentMng.serial_write.buff + kTransparentMng.serial_write.cur_size, buff, recv_len);
-					// 		kTransparentMng.serial_write.cur_size += recv_len;
-					// 		kTransparentMng.serial_write.total_size += recv_len;
-					// 	}
-					// }
-        			// pthread_mutex_unlock(&kTransparentMng.mutex);
+				if (cli_info[i].last_recv_time != 0 && cli_info[i].last_recv_time + 1000 < GetTime()) {
+					char buff[512] = {0};
+					snprintf(buff, sizeof(buff), "{\"data_len\":%d}", cli_info[i].recv_total_len);
+					int send_len = send(cli_info[i].fd, buff, strlen(buff), 0);
+					if (send_len < 0) {
+						cli_info[i].send_state = 0;
+						continue;
+					}
 				}
 			}
 		}
 
-		
-		if (kTransparentMng.serial_read.cur_size != 0) {
-			for(int i = 0; i < MAX_FD_NUM; i++) {
-				if (cli_info[i].fd == 0 || !cli_info[i].send_state) {
-					continue;
-				}
-				
-				int send_len = send(cli_info[i].fd, kTransparentMng.serial_read.buff, kTransparentMng.serial_read.cur_size, 0);
-				if (send_len < 0) {
-					cli_info[i].send_state = 0;
-				}
-			}
-
+		if (serial_clean_flag) {
+			serial_clean_flag = 0;
 			memset(kTransparentMng.serial_read.buff, 0, kTransparentMng.serial_read.cur_size);
 			kTransparentMng.serial_read.cur_size = 0;
 		}
@@ -214,26 +230,6 @@ void* ServerProc(void* arg) {
 	}
 	
 }
-
-// void* SerialProc(void* arg) {
-// 	while (1) {
-// 		usleep(500);
-// 		if (kTransparentMng.serial_write.cur_size <= 0) {
-// 			continue;
-// 		}
-
-// 		pthread_mutex_lock(&kTransparentMng.mutex);
-// 		int len = kTransparentMng.serial_write.cur_size < 210 ? kTransparentMng.serial_write.cur_size : 210;
-// 		int write_len = write(kTransparentMng.serial_fd, kTransparentMng.serial_write.buff, len);
-// 		memcpy(kTransparentMng.serial_write.buff, kTransparentMng.serial_write.buff+write_len, kTransparentMng.serial_write.cur_size - write_len);
-// 		kTransparentMng.serial_write.cur_size -= write_len;
-
-// 		// printf("write_len:%d len:%d buff_size:%d\n", write_len, len, kTransparentMng.serial_write.cur_size);
-// 		memset(kTransparentMng.serial_write.buff + kTransparentMng.serial_write.cur_size, 0, kTransparentMng.serial_write.total_size - kTransparentMng.serial_write.cur_size);
-// 		pthread_mutex_unlock(&kTransparentMng.mutex);
-// 	}
-	
-// }
 
 int main(int argc, char** argv) {
 	if (argc < 4) {
@@ -248,11 +244,6 @@ int main(int argc, char** argv) {
 	int baudrate = atoi(argv[3]);
 	kTransparentMng.sock_fd = TcpServerCreate(port);
 	kTransparentMng.serial_fd = SerialOpen(uart_path, baudrate);
-	
-	// kTransparentMng.serial_write.cur_size = 0;
-	// kTransparentMng.serial_write.total_size = SERIAL_WRITE_BUFF_SIZE;
-	// kTransparentMng.serial_write.buff = (char*)malloc(SERIAL_WRITE_BUFF_SIZE);
-	// memset(kTransparentMng.serial_write.buff, 0, SERIAL_WRITE_BUFF_SIZE);
 
 	kTransparentMng.serial_read.cur_size = 0;
 	kTransparentMng.serial_read.total_size = SERIAL_READ_BUFF_SIZE;
@@ -261,12 +252,11 @@ int main(int argc, char** argv) {
 
 	pthread_t pthread_id;
 	pthread_create(&pthread_id, NULL, ServerProc, NULL);
-	// pthread_t serial_pthread_id;
-	// pthread_create(&serial_pthread_id, NULL, SerialProc, NULL);
 	
 	pthread_join(pthread_id, NULL);
-	// pthread_join(serial_pthread_id, NULL);
 	
+	free(kTransparentMng.serial_read.buff);
+
 	SerialClose(kTransparentMng.serial_fd);
 	TcpServerClose(kTransparentMng.sock_fd);
 	
