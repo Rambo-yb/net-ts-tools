@@ -7,9 +7,10 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <sys/time.h>
-#include "serial.h"
 
-#define MAX_FD_NUM (10)
+#include "serial.h"
+#include "tcp_server.h"
+
 #define SERIAL_WRITE_BUFF_SIZE (1024*1024)
 #define SERIAL_READ_BUFF_SIZE (16*1024)
 #define RECV_DATA_LEN (688130)
@@ -45,49 +46,16 @@ long GetTime() {
     return time_.tv_sec*1000 + time_.tv_usec/1000;
 }
 
-int TcpServerCreate(int port) {
-	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-	if (sockfd < 0) {
-		perror("Failed to create socket");
-        return -1;
-    }
-	
-	int opt = 1;
-	setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (const void*)&opt, sizeof(opt));
-
-	struct sockaddr_in serveraddr;
-	serveraddr.sin_family = AF_INET;
-    serveraddr.sin_port = htons(port);
-    serveraddr.sin_addr.s_addr = INADDR_ANY;
-	if (bind(sockfd, (struct sockaddr *)&serveraddr, sizeof(struct sockaddr_in)) < 0) {
-        perror("Failed to bind address");
-		close(sockfd);
-        return -1;
-    }
-	
-    if (listen(sockfd, MAX_FD_NUM) < 0) {
-        perror("Failed to listen");
-		close(sockfd);
-        return -1;
-    }
-	
-	return sockfd;
-}
-
-int TcpServerClose(int sockfd) {
-	return close(sockfd);
-}
-
 void* ServerProc(void* arg) {
 	int serial_clean_flag = 0;
 	int client_cnt = 0;
-	SocketInfo cli_info[MAX_FD_NUM];
+	SocketInfo cli_info[MAX_CLIENT_NUM];
 	fd_set read_fd;
 	fd_set write_fd;
 	int max_fd = kTransparentMng.sock_fd;
-	int arr_fd[MAX_FD_NUM] = {0};
-	int fd_send[MAX_FD_NUM] = {0};
-	int total_size[MAX_FD_NUM] = {0};
+	int arr_fd[MAX_CLIENT_NUM] = {0};
+	int fd_send[MAX_CLIENT_NUM] = {0};
+	int total_size[MAX_CLIENT_NUM] = {0};
 	while(1) {
 		FD_ZERO(&read_fd);
 		FD_SET(kTransparentMng.sock_fd, &read_fd);
@@ -101,7 +69,7 @@ void* ServerProc(void* arg) {
 			max_fd = max_fd < kTransparentMng.serial_fd ? kTransparentMng.serial_fd : max_fd;
 		}
 		
-		for(int i = 0; i < MAX_FD_NUM; i++) {
+		for(int i = 0; i < MAX_CLIENT_NUM; i++) {
 			if (cli_info[i].fd > 0) {
 				FD_SET(cli_info[i].fd, &read_fd);
 				FD_SET(cli_info[i].fd, &write_fd);
@@ -127,13 +95,13 @@ void* ServerProc(void* arg) {
 				continue;
 			}
 			
-			if (client_cnt >= MAX_FD_NUM) {
+			if (client_cnt >= MAX_CLIENT_NUM) {
 				printf("max client arrive!\n");
 				close(cli_fd);
 				continue;
 			}
 			
-			for(int i = 0; i < MAX_FD_NUM; i++) {
+			for(int i = 0; i < MAX_CLIENT_NUM; i++) {
 				if (cli_info[i].fd == 0) {
 					cli_info[i].fd = cli_fd;
 					cli_info[i].send_state = 1;
@@ -174,7 +142,7 @@ void* ServerProc(void* arg) {
 			}
 		}
 		
-		for(int i = 0; i < MAX_FD_NUM; i++) {
+		for(int i = 0; i < MAX_CLIENT_NUM; i++) {
 			if (cli_info[i].fd == 0) {
 				continue;
 			}
@@ -205,7 +173,7 @@ void* ServerProc(void* arg) {
 			}
 		}
 		
-		for(int i = 0; i < MAX_FD_NUM; i++) {
+		for(int i = 0; i < MAX_CLIENT_NUM; i++) {
 			if (cli_info[i].fd == 0 || !cli_info[i].send_state) {
 				continue;
 			}
