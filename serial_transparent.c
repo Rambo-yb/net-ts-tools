@@ -17,8 +17,6 @@
 typedef struct {
 	int fd;
 	int send_state;
-	int recv_total_len;
-	long last_recv_time;
 
 	char ip[16];
 	int port;
@@ -37,7 +35,7 @@ typedef struct {
 	SerialSpace serial_write;
 	SerialSpace serial_read;
 }TransparentMng;
-static TransparentMng kTransparentMng = {.mutex = PTHREAD_MUTEX_INITIALIZER};
+static TransparentMng kTransparentMng = {.mutex = PTHREAD_MUTEX_INITIALIZER, .serial_fd = -1};
 
 long GetTime() {
     struct timeval time_;
@@ -86,18 +84,22 @@ void* ServerProc(void* arg) {
 	SocketInfo cli_info[MAX_FD_NUM];
 	fd_set read_fd;
 	fd_set write_fd;
-	int max_fd = kTransparentMng.sock_fd < kTransparentMng.serial_fd ? kTransparentMng.serial_fd : kTransparentMng.sock_fd;
+	int max_fd = kTransparentMng.sock_fd;
 	int arr_fd[MAX_FD_NUM] = {0};
 	int fd_send[MAX_FD_NUM] = {0};
 	int total_size[MAX_FD_NUM] = {0};
 	while(1) {
 		FD_ZERO(&read_fd);
 		FD_SET(kTransparentMng.sock_fd, &read_fd);
-		FD_SET(kTransparentMng.serial_fd, &read_fd);
 
 		FD_ZERO(&write_fd);
 		FD_SET(kTransparentMng.sock_fd, &write_fd);
-		FD_SET(kTransparentMng.serial_fd, &write_fd);
+
+		if (kTransparentMng.serial_fd != -1) {
+			FD_SET(kTransparentMng.serial_fd, &read_fd);
+			FD_SET(kTransparentMng.serial_fd, &write_fd);
+			max_fd = max_fd < kTransparentMng.serial_fd ? kTransparentMng.serial_fd : max_fd;
+		}
 		
 		for(int i = 0; i < MAX_FD_NUM; i++) {
 			if (cli_info[i].fd > 0) {
@@ -143,9 +145,14 @@ void* ServerProc(void* arg) {
 			
 			client_cnt++;
 			printf("we got a new connection, client_socket=%d, client_count=%d, ip=%s, port=%d\n", cli_fd, client_cnt, inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port));
+
+			if (kTransparentMng.serial_fd == -1) {
+				kTransparentMng.serial_fd = SerialOpen("/dev/ttyS3", 115200);
+				printf("open serial ttys3\n");
+			}
 		}
 		
-		if (FD_ISSET(kTransparentMng.serial_fd, &read_fd)) {
+		if (kTransparentMng.serial_fd != -1 && FD_ISSET(kTransparentMng.serial_fd, &read_fd)) {
 			char buff[1024] = {0};
 			int read_len = read(kTransparentMng.serial_fd, buff, sizeof(buff));
 			if (read_len > 0) {
@@ -180,14 +187,19 @@ void* ServerProc(void* arg) {
 						perror("recv ");
 					}
 
-					printf("we delete connection, client_socket=%d, client_count=%d, ip=%s, port=%d, total_len:%d\n", cli_info[i].fd, client_cnt, cli_info[i].ip, cli_info[i].port, cli_info[i].recv_total_len);
+					printf("we delete connection, client_socket=%d, client_count=%d, ip=%s, port=%d\n", cli_info[i].fd, client_cnt, cli_info[i].ip, cli_info[i].port);
 					client_cnt--;
 					FD_CLR(cli_info[i].fd, &read_fd);
 					close(cli_info[i].fd);
 					memset(&cli_info[i], 0, sizeof(SocketInfo));
+					if (client_cnt == 0) {
+						SerialClose(kTransparentMng.serial_fd);
+						kTransparentMng.serial_fd = -1;
+					}
 				} else {
-					cli_info[i].last_recv_time = GetTime();
-					cli_info[i].recv_total_len += recv_len;
+					if (kTransparentMng.serial_fd == -1) {
+						continue;
+					}
 					int write_len = write(kTransparentMng.serial_fd, buff, recv_len);
 				}
 			}
@@ -206,16 +218,7 @@ void* ServerProc(void* arg) {
 						cli_info[i].send_state = 0;
 						continue;
 					}
-				}
-
-				if (cli_info[i].last_recv_time != 0 && cli_info[i].last_recv_time + 1000 < GetTime()) {
-					char buff[512] = {0};
-					snprintf(buff, sizeof(buff), "{\"data_len\":%d}", cli_info[i].recv_total_len);
-					int send_len = send(cli_info[i].fd, buff, strlen(buff), 0);
-					if (send_len < 0) {
-						cli_info[i].send_state = 0;
-						continue;
-					}
+					printf("send serial data:%d\n", send_len);
 				}
 			}
 		}
@@ -243,7 +246,7 @@ int main(int argc, char** argv) {
     snprintf(uart_path, sizeof(uart_path), "%s", argv[2]);
 	int baudrate = atoi(argv[3]);
 	kTransparentMng.sock_fd = TcpServerCreate(port);
-	kTransparentMng.serial_fd = SerialOpen(uart_path, baudrate);
+	// kTransparentMng.serial_fd = SerialOpen(uart_path, baudrate);
 
 	kTransparentMng.serial_read.cur_size = 0;
 	kTransparentMng.serial_read.total_size = SERIAL_READ_BUFF_SIZE;
@@ -257,7 +260,7 @@ int main(int argc, char** argv) {
 	
 	free(kTransparentMng.serial_read.buff);
 
-	SerialClose(kTransparentMng.serial_fd);
+	// SerialClose(kTransparentMng.serial_fd);
 	TcpServerClose(kTransparentMng.sock_fd);
 	
 	
