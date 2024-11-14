@@ -15,7 +15,6 @@ typedef struct {
 	int sock_fd;
     int i2c_fd;
     unsigned short i2c_addr;
-    char i2c_path[16];
 	pthread_mutex_t mutex;
 }TransportMng;
 static TransportMng kTransportMng = {.mutex = PTHREAD_MUTEX_INITIALIZER};
@@ -89,7 +88,7 @@ static void* ServerProc(void* arg) {
 			}
 			
 			if (FD_ISSET(cli_info[i].fd, &read_fd)) {
-				char buff[10240] = {0};
+				char buff[1024] = {0};
 				int recv_len = recv(cli_info[i].fd, buff, sizeof(buff), 0);
 				if (recv_len <= 0) {
 					if (recv_len < 0) {
@@ -102,14 +101,25 @@ static void* ServerProc(void* arg) {
 					close(cli_info[i].fd);
 					memset(&cli_info[i], 0, sizeof(SocketInfo));
 				} else {
-                    unsigned char reg = 0;
-					if (strncmp(buff, "write:", sizeof("write:")) == 0) {
-                        int recv_len = recv(cli_info[i].fd, buff, sizeof(buff), 0);
-                        I2cWrite(kTransportMng.i2c_fd, kTransportMng.i2c_addr, reg, buff, recv_len);
-                    } else if(strncmp(buff, "read:", sizeof("read:")) == 0) {
-                        sscanf(buff, "read:%02x", &reg);
-                        I2cRead(kTransportMng.i2c_fd, kTransportMng.i2c_addr, reg, buff, 1);
-                        send(cli_info[i].fd, buff, 1, 0);
+					if (strncmp(buff, "write_single:", strlen("write_single:")) == 0) {
+						unsigned char val = 0;
+						unsigned char reg = 0;
+                        sscanf(buff, "%*[^:]: %02x %02x", &reg, &val);
+						I2cWrite(kTransportMng.i2c_fd, kTransportMng.i2c_addr, reg, val);
+					}else if (strncmp(buff, "write:", strlen("write:")) == 0) {
+						int offset = strlen("write:");
+						char i2c_buff[1024] = {0};
+						i2c_buff[0] = 0x47;
+						memcpy(i2c_buff+1, buff+offset, recv_len-offset);
+						i2c_buff[recv_len-offset+1] = 0x5a;
+                        I2cWriteArr(kTransportMng.i2c_fd, kTransportMng.i2c_addr, 0x00, i2c_buff, recv_len-offset+2);
+                    } else if(strncmp(buff, "read:", strlen("read:")) == 0) {
+                    	unsigned char reg = 0;
+						int size = 1;
+                        sscanf(buff, "%*[^:]: %02x %d", &reg, &size);
+						memset(buff, 0, sizeof(buff));
+                        I2cReadArr(kTransportMng.i2c_fd, kTransportMng.i2c_addr, reg, buff, size);
+                        send(cli_info[i].fd, buff, size, 0);
                     }
 				}
 			}
@@ -126,13 +136,19 @@ int main(int argc, char** argv) {
 		return -1;
     }
 
+
+	printf("%s %s %s\n", argv[1], argv[2], argv[3]);
+
     int port = atoi(argv[1]);
-    snprintf(kTransportMng.i2c_path, sizeof(kTransportMng.i2c_path), "%s", argv[2]);
     sscanf(argv[3], "0x%x", &kTransportMng.i2c_addr);
 
     kTransportMng.sock_fd = TcpServerCreate(port);
 
-    kTransportMng.i2c_fd = I2cOpen(kTransportMng.i2c_path);
+	printf("argv[2]:%s\n", argv[2]);
+    kTransportMng.i2c_fd = I2cOpen(argv[2]);
+	if (kTransportMng.i2c_fd <= 0) {
+		perror("");
+	}
 
     pthread_t pthread_id;
 	pthread_create(&pthread_id, NULL, ServerProc, NULL);
